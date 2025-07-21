@@ -3,15 +3,17 @@ import os
 import zipfile
 import gzip
 import py7zr  # Make sure to install this library using: pip install py7zr
-import pyminizip  # Optional, only if you want to use encryption for ZIP files || Could have done it with cryptography module to 
+import pyminizip  # For strong ZIP encryption
 
-# Function to zip files using zipfile and optional encryption
+# Function to zip files using pyminizip for encryption
 def zip_files(files, output_zip, password=None):
-    with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for file in files:
-            zipf.write(file)
+    rel_files = [os.path.basename(f) for f in files]
     if password:
-        pyminizip.compress_multiple(files, [], output_zip, password, 5)
+        pyminizip.compress_multiple(files, rel_files, output_zip, password, 5)
+    else:
+        with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for file in files:
+                zipf.write(file, os.path.basename(file))
 
 # Function to create a 7z archive
 def create_7z_archive(files, output_7z):
